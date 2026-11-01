@@ -848,6 +848,71 @@ async def test_group_members_entity_renamed(
 
 
 @pytest.mark.parametrize(
+    ("entity_id", "disabled_entity_ids", "expected_group", "output_indexes"),
+    [
+        pytest.param(
+            TEST_MASTER_ENTITY_NAME,
+            [],
+            TEST_ZONE_ENTITY_NAMES[:2],
+            [0, 1, 2],
+            id="server",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [],
+            [TEST_MASTER_ENTITY_NAME, TEST_ZONE_ENTITY_NAMES[1]],
+            [1, 2],
+            id="output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [TEST_MASTER_ENTITY_NAME],
+            [TEST_ZONE_ENTITY_NAMES[1]],
+            [1, 2],
+            id="output-with-server-disabled",
+        ),
+    ],
+)
+async def test_group_members_entity_removed(
+    hass: HomeAssistant,
+    mock_api_object: Mock,
+    entity_registry: er.EntityRegistry,
+    entity_id: str,
+    expected_group: list[str],
+    output_indexes: list[int],
+) -> None:
+    """Test deleting a member refreshes groups without an API update."""
+    mock_api_object.get_request.reset_mock()
+
+    entity_registry.async_remove(entity_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id) is None
+    for member in expected_group:
+        assert hass.states.get(member).attributes[ATTR_GROUP_MEMBERS] == expected_group
+    assert (
+        hass.states.get(TEST_ZONE_ENTITY_NAMES[2]).attributes[ATTR_GROUP_MEMBERS] == []
+    )
+    mock_api_object.get_request.assert_not_called()
+
+    await _service_call(
+        hass,
+        TEST_ZONE_ENTITY_NAMES[2],
+        SERVICE_JOIN,
+        {
+            ATTR_GROUP_MEMBERS: hass.states.get(TEST_ZONE_ENTITY_NAMES[1]).attributes[
+                ATTR_GROUP_MEMBERS
+            ]
+        },
+    )
+    assert mock_api_object.change_output.call_count == len(output_indexes)
+    for output_index in output_indexes:
+        mock_api_object.change_output.assert_any_call(
+            SAMPLE_OUTPUTS_ON[output_index]["id"], selected=True
+        )
+
+
+@pytest.mark.parametrize(
     ("entity_id", "disabled_entity_ids", "initial_group", "remaining_group"),
     [
         pytest.param(

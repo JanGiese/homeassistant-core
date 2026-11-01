@@ -187,6 +187,12 @@ class ForkedDaapdZone(MediaPlayerEntity):
 
         async_dispatcher_send(self.hass, SIGNAL_UPDATE_GROUP.format(self._entry_id))
 
+    @override
+    async def async_removed_from_registry(self) -> None:
+        """Refresh remaining groups after this output is deleted."""
+        await super().async_removed_from_registry()
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE_GROUP.format(self._entry_id))
+
     @callback
     def _async_update_output_callback(self, outputs):
         new_output = next(
@@ -378,6 +384,12 @@ class ForkedDaapdMaster(MediaPlayerEntity):
                 self._update_database,
             )
         )
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE_GROUP.format(self._entry_id))
+
+    @override
+    async def async_removed_from_registry(self) -> None:
+        """Refresh remaining groups after the server is deleted."""
+        await super().async_removed_from_registry()
         async_dispatcher_send(self.hass, SIGNAL_UPDATE_GROUP.format(self._entry_id))
 
     @callback
