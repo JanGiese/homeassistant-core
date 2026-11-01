@@ -25,8 +25,9 @@ from homeassistant.components.spotify import (
     resolve_spotify_media_type,
     spotify_uri_from_media_browser_url,
 )
-from homeassistant.const import CONF_HOST
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import CONF_HOST, Platform
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -51,6 +52,7 @@ from .const import (
     DEFAULT_TTS_PAUSE_TIME,
     DEFAULT_TTS_VOLUME,
     DEFAULT_UNMUTE_VOLUME,
+    DOMAIN,
     FD_NAME,
     KNOWN_PIPES,
     PIPE_FUNCTION_MAP,
@@ -104,6 +106,39 @@ async def async_setup_entry(
         )
     )
     config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
+
+    @callback
+    def async_group_registry_event_filter(
+        event_data: er.EventEntityRegistryUpdatedData,
+    ) -> bool:
+        """Filter registry changes that affect group membership."""
+        return event_data["action"] == "update" and (
+            "old_entity_id" in event_data or "disabled_by" in event_data["changes"]
+        )
+
+    @callback
+    def async_group_registry_updated(
+        event: Event[er.EventEntityRegistryUpdatedData],
+    ) -> None:
+        """Refresh groups when one of this entry's media players changes."""
+        entity_entry = er.async_get(hass).async_get(event.data["entity_id"])
+        if (
+            entity_entry is not None
+            and entity_entry.config_entry_id == config_entry.entry_id
+            and entity_entry.domain == Platform.MEDIA_PLAYER
+            and entity_entry.platform == DOMAIN
+        ):
+            async_dispatcher_send(
+                hass, SIGNAL_UPDATE_GROUP.format(config_entry.entry_id)
+            )
+
+    config_entry.async_on_unload(
+        hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED,
+            async_group_registry_updated,
+            event_filter=async_group_registry_event_filter,
+        )
+    )
 
     async_add_entities([forked_daapd_master], False)
 

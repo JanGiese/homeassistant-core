@@ -14,6 +14,7 @@ from homeassistant.components.forked_daapd.const import (
     CONF_TTS_PAUSE_TIME,
     CONF_TTS_VOLUME,
     DOMAIN,
+    SIGNAL_UPDATE_GROUP,
     SIGNAL_UPDATE_OUTPUTS,
     SIGNAL_UPDATE_PLAYER,
     SIGNAL_UPDATE_QUEUE,
@@ -70,6 +71,7 @@ from homeassistant.const import (
     STATE_PAUSED,
     STATE_PLAYING,
     STATE_UNAVAILABLE,
+    Platform,
 )
 from homeassistant.core import HomeAssistant, ServiceResponse
 from homeassistant.exceptions import ServiceValidationError
@@ -79,6 +81,7 @@ TEST_MASTER_ENTITY_NAME = "media_player.owntone_server"
 TEST_ZONE_ENTITY_NAMES = [
     "media_player.owntone_output_" + x for x in ("kitchen", "computer", "daapd_fifo")
 ]
+TEST_RENAMED_ENTITY_NAME = "media_player.renamed_member"
 
 OPTIONS_DATA = {
     CONF_LIBRESPOT_JAVA_PORT: "123",
@@ -777,6 +780,226 @@ def test_group_members(
     """Test initial group membership includes only enabled, selected entities."""
     state = hass.states.get(entity_id)
     assert state.attributes[ATTR_GROUP_MEMBERS] == expected_group
+
+
+@pytest.mark.parametrize(
+    ("entity_id", "disabled_entity_ids", "expected_group"),
+    [
+        pytest.param(
+            TEST_MASTER_ENTITY_NAME,
+            [],
+            [TEST_RENAMED_ENTITY_NAME, *TEST_ZONE_ENTITY_NAMES[:2]],
+            id="server",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [],
+            [
+                TEST_MASTER_ENTITY_NAME,
+                TEST_RENAMED_ENTITY_NAME,
+                TEST_ZONE_ENTITY_NAMES[1],
+            ],
+            id="output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [TEST_MASTER_ENTITY_NAME],
+            [TEST_RENAMED_ENTITY_NAME, TEST_ZONE_ENTITY_NAMES[1]],
+            id="output-with-server-disabled",
+        ),
+    ],
+)
+async def test_group_members_entity_renamed(
+    hass: HomeAssistant,
+    mock_api_object: Mock,
+    entity_registry: er.EntityRegistry,
+    entity_id: str,
+    expected_group: list[str],
+) -> None:
+    """Test renaming a member refreshes all published groups without an API update."""
+    mock_api_object.get_request.reset_mock()
+
+    entity_registry.async_update_entity(
+        entity_id, new_entity_id=TEST_RENAMED_ENTITY_NAME
+    )
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id) is None
+    for member in expected_group:
+        assert hass.states.get(member).attributes[ATTR_GROUP_MEMBERS] == expected_group
+    assert (
+        hass.states.get(TEST_ZONE_ENTITY_NAMES[2]).attributes[ATTR_GROUP_MEMBERS] == []
+    )
+    mock_api_object.get_request.assert_not_called()
+
+    await _service_call(
+        hass,
+        TEST_ZONE_ENTITY_NAMES[2],
+        SERVICE_JOIN,
+        {
+            ATTR_GROUP_MEMBERS: hass.states.get(TEST_RENAMED_ENTITY_NAME).attributes[
+                ATTR_GROUP_MEMBERS
+            ]
+        },
+    )
+    assert mock_api_object.change_output.call_count == 3
+    for output in SAMPLE_OUTPUTS_ON:
+        mock_api_object.change_output.assert_any_call(output["id"], selected=True)
+
+
+@pytest.mark.parametrize(
+    ("entity_id", "disabled_entity_ids", "initial_group", "remaining_group"),
+    [
+        pytest.param(
+            TEST_MASTER_ENTITY_NAME,
+            [],
+            [TEST_MASTER_ENTITY_NAME, *TEST_ZONE_ENTITY_NAMES[:2]],
+            TEST_ZONE_ENTITY_NAMES[:2],
+            id="server",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [],
+            [TEST_MASTER_ENTITY_NAME, *TEST_ZONE_ENTITY_NAMES[:2]],
+            [TEST_MASTER_ENTITY_NAME, TEST_ZONE_ENTITY_NAMES[1]],
+            id="output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [TEST_MASTER_ENTITY_NAME],
+            TEST_ZONE_ENTITY_NAMES[:2],
+            [TEST_ZONE_ENTITY_NAMES[1]],
+            id="output-with-server-disabled",
+        ),
+    ],
+)
+async def test_group_members_entity_disabled_and_enabled(
+    hass: HomeAssistant,
+    mock_api_object: Mock,
+    entity_registry: er.EntityRegistry,
+    entity_id: str,
+    initial_group: list[str],
+    remaining_group: list[str],
+) -> None:
+    """Test disabling and enabling a member immediately refreshes the other groups."""
+    mock_api_object.get_request.reset_mock()
+
+    entity_registry.async_update_entity(
+        entity_id, disabled_by=er.RegistryEntryDisabler.USER
+    )
+    await hass.async_block_till_done()
+
+    for member in remaining_group:
+        assert hass.states.get(member).attributes[ATTR_GROUP_MEMBERS] == remaining_group
+
+    entity_registry.async_update_entity(entity_id, disabled_by=None)
+    await hass.async_block_till_done()
+
+    # Check the remaining entities before Core's delayed reload re-adds the member.
+    for member in remaining_group:
+        assert hass.states.get(member).attributes[ATTR_GROUP_MEMBERS] == initial_group
+    assert (
+        hass.states.get(TEST_ZONE_ENTITY_NAMES[2]).attributes[ATTR_GROUP_MEMBERS] == []
+    )
+    mock_api_object.get_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        pytest.param({"name": "New name"}, id="name"),
+        pytest.param({"icon": "mdi:speaker"}, id="icon"),
+    ],
+)
+@pytest.mark.usefixtures("mock_api_object")
+async def test_group_members_unrelated_registry_update(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+    updates: dict[str, str],
+) -> None:
+    """Test unrelated member settings do not trigger a group refresh."""
+    group_signals = async_mock_signal(
+        hass, SIGNAL_UPDATE_GROUP.format(config_entry.entry_id)
+    )
+    entity_registry.async_update_entity(TEST_MASTER_ENTITY_NAME, **updates)
+    await hass.async_block_till_done()
+
+    assert group_signals == []
+
+
+@pytest.mark.parametrize(
+    ("entity_domain", "entity_platform", "entry_key"),
+    [
+        pytest.param(Platform.LIGHT, DOMAIN, "own", id="other-domain"),
+        pytest.param(Platform.MEDIA_PLAYER, "demo", "own", id="other-platform"),
+        pytest.param(Platform.MEDIA_PLAYER, DOMAIN, "other", id="other-config-entry"),
+    ],
+)
+@pytest.mark.usefixtures("mock_api_object")
+async def test_group_members_foreign_registry_update(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+    entity_domain: Platform,
+    entity_platform: str,
+    entry_key: str,
+) -> None:
+    """Test registry changes outside this entry's media players are ignored."""
+    other_entry = MockConfigEntry(domain=DOMAIN)
+    other_entry.add_to_hass(hass)
+    entries = {"own": config_entry, "other": other_entry}
+    group_signals = async_mock_signal(
+        hass, SIGNAL_UPDATE_GROUP.format(config_entry.entry_id)
+    )
+    entity_entry = entity_registry.async_get_or_create(
+        entity_domain,
+        entity_platform,
+        "unrelated",
+        config_entry=entries[entry_key],
+    )
+    await hass.async_block_till_done()
+    new_entity_id = f"{entity_domain}.renamed_unrelated"
+    entity_registry.async_update_entity(
+        entity_entry.entity_id, new_entity_id=new_entity_id
+    )
+    await hass.async_block_till_done()
+    entity_registry.async_remove(new_entity_id)
+    await hass.async_block_till_done()
+
+    assert group_signals == []
+
+
+async def test_group_registry_listener_unload_and_reload(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_api_object: Mock,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test the group registry listener is removed on unload and restored once."""
+    group_signals = async_mock_signal(
+        hass, SIGNAL_UPDATE_GROUP.format(config_entry.entry_id)
+    )
+    await hass.config_entries.async_unload(config_entry.entry_id)
+    entity_registry.async_update_entity(
+        TEST_MASTER_ENTITY_NAME, new_entity_id=TEST_RENAMED_ENTITY_NAME
+    )
+    await hass.async_block_till_done()
+    assert group_signals == []
+
+    with patch(
+        "homeassistant.components.forked_daapd.ForkedDaapdAPI",
+        return_value=mock_api_object,
+    ):
+        await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    group_signals.clear()
+    entity_registry.async_update_entity(
+        TEST_RENAMED_ENTITY_NAME, new_entity_id=TEST_MASTER_ENTITY_NAME
+    )
+    await hass.async_block_till_done()
+    assert len(group_signals) == 1
 
 
 @pytest.mark.parametrize("disabled_entity_ids", [[TEST_MASTER_ENTITY_NAME]])
