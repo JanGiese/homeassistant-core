@@ -13,6 +13,7 @@ from homeassistant.components.forked_daapd.const import (
     CONF_MAX_PLAYLISTS,
     CONF_TTS_PAUSE_TIME,
     CONF_TTS_VOLUME,
+    DOMAIN,
     SIGNAL_UPDATE_OUTPUTS,
     SIGNAL_UPDATE_PLAYER,
     SIGNAL_UPDATE_QUEUE,
@@ -305,15 +306,23 @@ async def get_request_return_values_fixture() -> dict[str, Any]:
     }
 
 
+@pytest.fixture
+def disabled_entity_ids() -> list[str]:
+    """Return entities disabled before integration setup."""
+    return []
+
+
 @pytest.fixture(name="mock_api_object")
 async def mock_api_object_fixture(
     hass: HomeAssistant,
     config_entry: MockConfigEntry,
     get_request_return_values: dict[str, Any],
+    entity_registry: er.EntityRegistry,
+    disabled_entity_ids: list[str],
 ) -> Mock:
     """Create mock api fixture."""
 
-    async def get_request_side_effect(update_type):
+    async def get_request_side_effect(update_type: str) -> dict[str, Any]:
         if update_type == "outputs":
             return {"outputs": get_request_return_values["outputs"]}
         return get_request_return_values[update_type]
@@ -327,13 +336,32 @@ async def mock_api_object_fixture(
         mock_api.return_value.get_pipes.return_value = SAMPLE_PIPES
         mock_api.return_value.get_playlists.return_value = SAMPLE_PLAYLISTS
         config_entry.add_to_hass(hass)
+        unique_ids = {
+            TEST_MASTER_ENTITY_NAME: config_entry.entry_id,
+            **{
+                entity_id: f"{config_entry.entry_id}-{output['id']}"
+                for entity_id, output in zip(
+                    TEST_ZONE_ENTITY_NAMES, SAMPLE_OUTPUTS_ON, strict=True
+                )
+            },
+        }
+        for entity_id in disabled_entity_ids:
+            entity_registry.async_get_or_create(
+                MP_DOMAIN,
+                DOMAIN,
+                unique_ids[entity_id],
+                config_entry=config_entry,
+                suggested_object_id=entity_id.split(".", 1)[1],
+                disabled_by=er.RegistryEntryDisabler.USER,
+            )
         await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
 
     mock_api.return_value.start_websocket_handler.assert_called_once()
     mock_api.return_value.get_request.assert_called_once()
     updater_update = mock_api.return_value.start_websocket_handler.call_args[0][2]
-    await updater_update(["player", "outputs", "queue"])
+    async with asyncio.timeout(5):
+        await updater_update(["player", "outputs", "queue"])
     await hass.async_block_till_done()
 
     async def add_to_queue_side_effect(
@@ -517,6 +545,13 @@ async def test_join_players(hass: HomeAssistant, mock_api_object: Mock) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "disabled_entity_ids",
+    [
+        pytest.param([], id="server-enabled"),
+        pytest.param([TEST_MASTER_ENTITY_NAME], id="server-disabled"),
+    ],
+)
 async def test_join_players_from_zone(
     hass: HomeAssistant, mock_api_object: Mock
 ) -> None:
@@ -525,7 +560,7 @@ async def test_join_players_from_zone(
         hass,
         TEST_ZONE_ENTITY_NAMES[2],
         SERVICE_JOIN,
-        {ATTR_GROUP_MEMBERS: [TEST_ZONE_ENTITY_NAMES[0]]},
+        {ATTR_GROUP_MEMBERS: [TEST_ZONE_ENTITY_NAMES[0], TEST_MASTER_ENTITY_NAME]},
     )
     mock_api_object.change_output.assert_any_call(
         SAMPLE_OUTPUTS_ON[2]["id"], selected=True
@@ -537,10 +572,13 @@ async def test_join_players_from_zone(
 
 
 @pytest.mark.parametrize(
-    "entity_id",
+    ("entity_id", "disabled_entity_ids"),
     [
-        pytest.param(TEST_MASTER_ENTITY_NAME, id="master"),
-        pytest.param(TEST_ZONE_ENTITY_NAMES[2], id="output"),
+        pytest.param(TEST_MASTER_ENTITY_NAME, [], id="master"),
+        pytest.param(TEST_ZONE_ENTITY_NAMES[2], [], id="output"),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[2], [TEST_MASTER_ENTITY_NAME], id="server-disabled"
+        ),
     ],
 )
 async def test_join_players_unknown_entity(
@@ -559,27 +597,64 @@ async def test_join_players_unknown_entity(
     mock_api_object.change_output.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("entity_id", "disabled_entity_ids"),
+    [
+        pytest.param(TEST_MASTER_ENTITY_NAME, [], id="master"),
+        pytest.param(TEST_ZONE_ENTITY_NAMES[2], [], id="output"),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[2], [TEST_MASTER_ENTITY_NAME], id="server-disabled"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "platform",
+    [
+        pytest.param("other_platform", id="other-platform"),
+        pytest.param(DOMAIN, id="other-server"),
+    ],
+)
 async def test_join_players_foreign_entity(
     hass: HomeAssistant,
     mock_api_object: Mock,
     entity_registry: er.EntityRegistry,
+    entity_id: str,
+    platform: str,
 ) -> None:
-    """Test joining an entity from another platform raises."""
-    entity_registry.async_get_or_create(MP_DOMAIN, "other_platform", "some_unique_id")
+    """Test joining an entity from another platform or server raises."""
+    other_config_entry = MockConfigEntry(domain=DOMAIN)
+    other_config_entry.add_to_hass(hass)
+    foreign_entity = entity_registry.async_get_or_create(
+        MP_DOMAIN,
+        platform,
+        f"{other_config_entry.entry_id}-{SAMPLE_OUTPUTS_ON[0]['id']}",
+        config_entry=other_config_entry,
+    )
     with pytest.raises(ServiceValidationError, match="not an output"):
         await _service_call(
             hass,
-            TEST_MASTER_ENTITY_NAME,
+            entity_id,
             SERVICE_JOIN,
-            {ATTR_GROUP_MEMBERS: ["media_player.other_platform_some_unique_id"]},
+            {ATTR_GROUP_MEMBERS: [foreign_entity.entity_id]},
         )
     mock_api_object.change_output.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("entity_id", "disabled_entity_ids"),
+    [
+        pytest.param(TEST_MASTER_ENTITY_NAME, [], id="master"),
+        pytest.param(TEST_ZONE_ENTITY_NAMES[0], [], id="output"),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0], [TEST_MASTER_ENTITY_NAME], id="server-disabled"
+        ),
+    ],
+)
 async def test_join_players_stale_output(
     hass: HomeAssistant,
     mock_api_object: Mock,
     get_request_return_values: dict[str, Any],
+    entity_id: str,
 ) -> None:
     """Test joining a zone whose output disappeared from the server raises."""
     get_request_return_values["outputs"] = SAMPLE_OUTPUTS_UNSELECTED[:2]
@@ -589,7 +664,7 @@ async def test_join_players_stale_output(
     with pytest.raises(ServiceValidationError, match="no longer exists"):
         await _service_call(
             hass,
-            TEST_MASTER_ENTITY_NAME,
+            entity_id,
             SERVICE_JOIN,
             {ATTR_GROUP_MEMBERS: [TEST_ZONE_ENTITY_NAMES[2]]},
         )
@@ -605,6 +680,13 @@ async def test_unjoin_players(hass: HomeAssistant, mock_api_object: Mock) -> Non
 @pytest.mark.parametrize(
     "output_index",
     [pytest.param(0, id="selected"), pytest.param(2, id="unselected")],
+)
+@pytest.mark.parametrize(
+    "disabled_entity_ids",
+    [
+        pytest.param([], id="server-enabled"),
+        pytest.param([TEST_MASTER_ENTITY_NAME], id="server-disabled"),
+    ],
 )
 async def test_unjoin_output(
     hass: HomeAssistant, mock_api_object: Mock, output_index: int
@@ -648,21 +730,153 @@ async def test_unjoin_output_group_update(
 
 
 @pytest.mark.parametrize(
-    "entity_id",
+    ("entity_id", "disabled_entity_ids", "expected_group"),
     [
-        pytest.param(TEST_MASTER_ENTITY_NAME, id="master"),
-        pytest.param(TEST_ZONE_ENTITY_NAMES[0], id="output"),
+        pytest.param(
+            TEST_MASTER_ENTITY_NAME,
+            [],
+            [TEST_MASTER_ENTITY_NAME, *TEST_ZONE_ENTITY_NAMES[:2]],
+            id="master",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [],
+            [TEST_MASTER_ENTITY_NAME, *TEST_ZONE_ENTITY_NAMES[:2]],
+            id="output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[0],
+            [TEST_MASTER_ENTITY_NAME],
+            TEST_ZONE_ENTITY_NAMES[:2],
+            id="server-disabled-first-output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[1],
+            [TEST_MASTER_ENTITY_NAME],
+            TEST_ZONE_ENTITY_NAMES[:2],
+            id="server-disabled-second-output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[2],
+            [TEST_MASTER_ENTITY_NAME],
+            [],
+            id="server-disabled-unselected-output",
+        ),
+        pytest.param(
+            TEST_ZONE_ENTITY_NAMES[1],
+            [TEST_MASTER_ENTITY_NAME, TEST_ZONE_ENTITY_NAMES[0]],
+            [TEST_ZONE_ENTITY_NAMES[1]],
+            id="server-and-first-output-disabled",
+        ),
     ],
 )
 @pytest.mark.usefixtures("mock_api_object")
-def test_group_members(hass: HomeAssistant, entity_id: str) -> None:
-    """Test group_members lists the master and all selected outputs."""
+def test_group_members(
+    hass: HomeAssistant, entity_id: str, expected_group: list[str]
+) -> None:
+    """Test initial group membership includes only enabled, selected entities."""
     state = hass.states.get(entity_id)
-    assert state.attributes[ATTR_GROUP_MEMBERS] == [
-        TEST_MASTER_ENTITY_NAME,
-        TEST_ZONE_ENTITY_NAMES[0],
-        TEST_ZONE_ENTITY_NAMES[1],
+    assert state.attributes[ATTR_GROUP_MEMBERS] == expected_group
+
+
+@pytest.mark.parametrize("disabled_entity_ids", [[TEST_MASTER_ENTITY_NAME]])
+@pytest.mark.parametrize(
+    "update_types",
+    [
+        pytest.param(["player"], id="player"),
+        pytest.param(["queue"], id="queue"),
+        pytest.param(["database"], id="database"),
+        pytest.param(["outputs"], id="outputs"),
+        pytest.param(["volume"], id="volume"),
+        pytest.param(["queue", "player", "database", "outputs"], id="combined"),
+    ],
+)
+async def test_updates_with_server_disabled(
+    hass: HomeAssistant, mock_api_object: Mock, update_types: list[str]
+) -> None:
+    """Test websocket updates complete without server entity listeners."""
+    assert hass.states.get(TEST_MASTER_ENTITY_NAME) is None
+    updater_update = mock_api_object.start_websocket_handler.call_args[0][2]
+    async with asyncio.timeout(5):
+        await updater_update(update_types)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(TEST_ZONE_ENTITY_NAMES[0])
+    assert state.state == STATE_ON
+    assert state.attributes[ATTR_GROUP_MEMBERS] == TEST_ZONE_ENTITY_NAMES[:2]
+
+
+@pytest.mark.parametrize("disabled_entity_ids", [[TEST_MASTER_ENTITY_NAME]])
+async def test_output_group_update_with_server_disabled(
+    hass: HomeAssistant,
+    mock_api_object: Mock,
+    get_request_return_values: dict[str, Any],
+) -> None:
+    """Test output membership changes without the server entity."""
+    await _service_call(hass, TEST_ZONE_ENTITY_NAMES[0], SERVICE_UNJOIN)
+    mock_api_object.change_output.assert_called_once_with(
+        SAMPLE_OUTPUTS_ON[0]["id"], selected=False
+    )
+    get_request_return_values["outputs"] = [
+        SAMPLE_OUTPUTS_UNSELECTED[0],
+        SAMPLE_OUTPUTS_ON[1],
+        {**SAMPLE_OUTPUTS_ON[2], "selected": True},
     ]
+    updater_update = mock_api_object.start_websocket_handler.call_args[0][2]
+    async with asyncio.timeout(5):
+        await updater_update(["outputs"])
+    await hass.async_block_till_done()
+
+    assert (
+        hass.states.get(TEST_ZONE_ENTITY_NAMES[0]).attributes[ATTR_GROUP_MEMBERS] == []
+    )
+    assert (
+        hass.states.get(TEST_ZONE_ENTITY_NAMES[1]).attributes[ATTR_GROUP_MEMBERS]
+        == TEST_ZONE_ENTITY_NAMES[1:]
+    )
+    assert (
+        hass.states.get(TEST_ZONE_ENTITY_NAMES[2]).attributes[ATTR_GROUP_MEMBERS]
+        == TEST_ZONE_ENTITY_NAMES[1:]
+    )
+
+
+@pytest.mark.parametrize(
+    ("disabled_entity_ids", "expected_group"),
+    [
+        pytest.param(
+            [],
+            [TEST_MASTER_ENTITY_NAME, *TEST_ZONE_ENTITY_NAMES[:2]],
+            id="server-enabled",
+        ),
+        pytest.param(
+            [TEST_MASTER_ENTITY_NAME],
+            TEST_ZONE_ENTITY_NAMES[:2],
+            id="server-disabled",
+        ),
+    ],
+)
+async def test_group_members_new_output(
+    hass: HomeAssistant,
+    mock_api_object: Mock,
+    get_request_return_values: dict[str, Any],
+    expected_group: list[str],
+) -> None:
+    """Test registering a new output refreshes existing output groups."""
+    new_entity_id = "media_player.owntone_output_living_room"
+    get_request_return_values["outputs"] = [
+        *SAMPLE_OUTPUTS_ON,
+        {**SAMPLE_OUTPUTS_ON[0], "id": "new-output", "name": "living room"},
+    ]
+    updater_update = mock_api_object.start_websocket_handler.call_args[0][2]
+    async with asyncio.timeout(5):
+        await updater_update(["outputs"])
+    await hass.async_block_till_done()
+
+    for entity_id in (*expected_group, new_entity_id):
+        assert hass.states.get(entity_id).attributes[ATTR_GROUP_MEMBERS] == [
+            *expected_group,
+            new_entity_id,
+        ]
 
 
 async def test_last_outputs_master(hass: HomeAssistant, mock_api_object: Mock) -> None:
